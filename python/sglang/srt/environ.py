@@ -168,6 +168,7 @@ class Envs:
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     SGLANG_ROCM_USE_AITER_LINEAR_SHUFFLE = EnvBool(False)
+    SGLANG_ROCM_USE_AITER_PA_ASM_PRESHUFFLE_LAYOUT = EnvBool(False)
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
@@ -238,6 +239,7 @@ class Envs:
 
     # VLM
     SGLANG_IMAGE_MAX_PIXELS = EnvInt(16384 * 28 * 28)
+    SGLANG_IMAGE_MIN_PIXELS = EnvInt(4 * 28 * 28)
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
 
     # Ktransformers
