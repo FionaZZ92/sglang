@@ -1,4 +1,4 @@
-# Set Environment
+<img width="951" height="108" alt="image" src="https://github.com/user-attachments/assets/e328be35-6596-4816-8d5d-8763c3ba4239" /># Set Environment
 
 1. Docker image:
 
@@ -8,7 +8,7 @@
 2. Install aiter:
    ```
    pip uninstall aiter
-   git clone -b qwen3vl-project https://github.com/ZLkanyo009/aiter.git
+   git clone -b dev/perf https://github.com/ROCm/aiter.git
    cd aiter
    git checkout <target_commit>
    git submodule sync && git submodule update --init --recursive
@@ -33,7 +33,7 @@
 
 
 # Launch server
-1. download model Qwen3-Omni-30B-A3B-Instruct
+1. download model Qwen3-Omni-30B-A3B-Instruct (bf16)
 
     ```bash
     huggingface-cli download Qwen/Qwen3-Omni-30B-A3B-Instruct --local-dir /models/Qwen3-Omni-30B-A3B-Instruct
@@ -45,33 +45,37 @@
     ```bash
     model=/models/Qwen3-Omni-30B-A3B-Instruct/
     TP=4
-    DP=2
+    DP=1
 
     echo "launching ${model}"
     echo "TP=${TP}"
     echo "DP=${DP}"
 
-     SGLANG_VLM_CACHE_SIZE_MB=0 \
+     ROCM_QUICK_REDUCE_QUANTIZATION=INT4 \
+     SGLANG_IO_WORKERS=8 \
+     SGLANG_USE_CUDA_IPC_TRANSPORT=1 \
+     SGLANG_VLM_CACHE_SIZE_MB=8192 \
      SGLANG_USE_AITER=1 \
      USE_PA=1 \
      SGLANG_ROCM_USE_AITER_PA_ASM_PRESHUFFLE_LAYOUT=0 \
      SGLANG_ROCM_USE_AITER_LINEAR_SHUFFLE=1 \
      python3 -m sglang.launch_server \
-        --model-path $MODEL_PATH \
-        --host localhost    \
-        --port 9000 \
-        --tensor-parallel-size ${TP} \
-        --data-parallel-size ${DP} \
-        --trust-remote-code \
-        --chunked-prefill-size 32768 \
-        --mem-fraction-static 0.85 \
-        --mm-attention-backend "aiter_attn" \
-        --max-prefill-tokens 32768 \
-        --disable-radix-cache \
-        --page-size 64 \
-        --mm-enable-dp-encoder \
-        --cuda-graph-max-bs 8
-        2>&1 | tee log.server.log &
+         --model-path /app/models/Qwen3-Omni-30B-A3B-Instruct/ \
+         --host localhost \
+         --port 9000 \
+         --tensor-parallel-size ${TP} \
+         --data-parallel-size ${DP} \
+         --trust-remote-code \
+         --chunked-prefill-size 32768 \
+         --mem-fraction-static 0.85 \
+         --mm-attention-backend "aiter_attn" \
+         --max-prefill-tokens 32768 \
+         --page-size 32 \
+         --mm-enable-dp-encoder \
+         --disable-radix-cache  \
+         --enable-aiter-allreduce-fusion \
+         --max-running-requests 64 \
+         --cuda-graph-max-bs 8 2>&1 | tee log.server.log &
 
     ```
     You can add `--mm-enable-dp-encoder` when launch server, this command can reduces TTFT for multi-modal workloads under some testing conditions.
