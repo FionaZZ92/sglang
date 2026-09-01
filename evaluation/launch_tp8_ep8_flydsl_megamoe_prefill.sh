@@ -58,6 +58,7 @@ MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.80}"
 SWA_FULL_TOKENS_RATIO="${SWA_FULL_TOKENS_RATIO:-0.01}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-1048576}"
 CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-16384}"
+MAX_PREFILL_TOKENS="${MAX_PREFILL_TOKENS:-1048576}"
 RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 LOG_DIR="${LOG_DIR:-${SCRIPT_DIR}/logs/mimo_flydsl_megamoe_tp${TP_SIZE}_ep${EP_SIZE}_${RUN_ID}}"
 LOG_FILE="${LOG_FILE:-server.log}"
@@ -70,6 +71,10 @@ if ! [[ "${SGLANG_FLYDSL_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK}" =~ ^[1-9][0-9]*$ ]];
 fi
 if ! [[ "${CHUNKED_PREFILL_SIZE}" =~ ^[1-9][0-9]*$ ]]; then
   echo "CHUNKED_PREFILL_SIZE must be a positive integer" >&2
+  exit 2
+fi
+if ! [[ "${MAX_PREFILL_TOKENS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "MAX_PREFILL_TOKENS must be a positive integer" >&2
   exit 2
 fi
 for parallel_size in "${DP_SIZE}"; do
@@ -115,7 +120,7 @@ PY
 echo "Model: ${MODEL_PATH}"
 echo "Configuration: TP${TP_SIZE} / DP${DP_SIZE} / EP${EP_SIZE} / attention-TP${attention_tp_size} / FlyDSL MegaMoE"
 echo "MegaMoE capacity: ${SGLANG_FLYDSL_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK} tokens/rank"
-echo "Context/chunk: ${CONTEXT_LENGTH}/${CHUNKED_PREFILL_SIZE}; SWA ratio: ${SWA_FULL_TOKENS_RATIO}"
+echo "Context/chunk/max-prefill: ${CONTEXT_LENGTH}/${CHUNKED_PREFILL_SIZE}/${MAX_PREFILL_TOKENS}; SWA ratio: ${SWA_FULL_TOKENS_RATIO}"
 echo "MORI heap: ${MORI_SHMEM_HEAP_SIZE}; FlyDSL cache: ${FLYDSL_RUNTIME_CACHE_DIR}"
 echo "Server log: ${LOG_DIR}/${LOG_FILE}"
 
@@ -146,7 +151,7 @@ python3 -u -m sglang.launch_server \
   --tool-call-parser mimo \
   --context-length "${CONTEXT_LENGTH}" \
   --chunked-prefill-size "${CHUNKED_PREFILL_SIZE}" \
-  --max-prefill-tokens "${CHUNKED_PREFILL_SIZE}" \
+  --max-prefill-tokens "${MAX_PREFILL_TOKENS}" \
   --max-running-requests "${MAX_RUNNING_REQUESTS}" \
   --mem-fraction-static "${MEM_FRACTION_STATIC}" \
   --swa-full-tokens-ratio "${SWA_FULL_TOKENS_RATIO}" \
