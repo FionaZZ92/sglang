@@ -32,10 +32,10 @@ from sglang.srt.distributed import (
     get_tp_group,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-from sglang.srt.environ import envs
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -99,8 +99,9 @@ from sglang.srt.utils import (
     LazyValue,
     add_prefix,
     get_bool_env_var,
-    is_gfx942_supported,
     is_gfx95_supported,
+    is_gfx942_supported,
+    is_hip,
     is_non_idle_and_non_empty,
     make_layers,
 )
@@ -369,6 +370,18 @@ class MiMoV2MoE(nn.Module):
             routed_scaling_factor=1.0,
             prefix=add_prefix("experts", prefix),
         )
+        if is_hip() and get_moe_a2a_backend().is_megamoe():
+            if quant_config is None or quant_config.get_name() != "fp8":
+                raise NotImplementedError(
+                    "FlyDSL MegaMoE for MiMo currently supports the FP8 target "
+                    "model only; unquantized speculative/MTP experts are not yet "
+                    "supported. Launch without speculative decoding."
+                )
+            if get_global_server_args().ep_num_redundant_experts != 0:
+                raise NotImplementedError(
+                    "FlyDSL MegaMoE for MiMo does not yet support redundant/EPLB experts"
+                )
+            self.experts._use_flydsl_mega_moe = True
 
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
@@ -427,6 +440,14 @@ class MiMoV2MoE(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
+        from sglang.srt.layers.moe.mega_moe import (
+            forward_mega_moe,
+            should_use_mega_moe,
+        )
+
+        if should_use_mega_moe(self, hidden_states):
+            return forward_mega_moe(self, hidden_states, forward_batch)
+
         if not self._enable_a2a_moe:
             return self.forward_normal(
                 hidden_states,
@@ -1143,8 +1164,7 @@ class MiMoV2Model(nn.Module):
         if forward_batch.tbo_children is None or len(forward_batch.tbo_children) != 2:
             return "the TBO split does not contain exactly two children"
         if any(
-            (child.tbo_padded_len or 0) <= 0
-            for child in forward_batch.tbo_children
+            (child.tbo_padded_len or 0) <= 0 for child in forward_batch.tbo_children
         ):
             return "at least one TBO child is empty"
         if (
@@ -1386,9 +1406,13 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
 
         vision_config = getattr(config, "vision_config", None)
         audio_config = getattr(config, "audio_config", None)
-        self._is_multimodal = vision_config is not None and audio_config is not None
-        # Always build vision/audio encoders so P can fall back to local
-        # encoding when the EPD encoder is unreachable.
+        self._is_multimodal = (
+            get_global_server_args().enable_multimodal is not False
+            and vision_config is not None
+            and audio_config is not None
+        )
+        # Build vision/audio encoders unless multimodal support was explicitly
+        # disabled for a text-only deployment.
         if self._is_multimodal:
             if hasattr(vision_config, "to_dict"):
                 vision_config = vision_config.to_dict()

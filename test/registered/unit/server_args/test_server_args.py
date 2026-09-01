@@ -31,6 +31,42 @@ _mock_device.start()
 
 
 class TestPrepareServerArgs(CustomTestCase):
+    def test_disable_multimodal_flag(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        args = parser.parse_args(["--model-path", "dummy", "--no-enable-multimodal"])
+
+        self.assertFalse(args.enable_multimodal)
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_flydsl_megamoe_rejects_incompatible_runner(self, _):
+        args = SimpleNamespace(
+            enable_deepep_waterfill=False,
+            moe_a2a_backend="megamoe",
+            tp_size=8,
+            ep_size=1,
+            enable_two_batch_overlap=False,
+            moe_runner_backend="aiter",
+        )
+
+        with self.assertRaisesRegex(ValueError, "moe-runner-backend triton"):
+            ServerArgs._handle_a2a_moe(args)
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_flydsl_megamoe_rejects_two_batch_overlap(self, _):
+        args = SimpleNamespace(
+            enable_deepep_waterfill=False,
+            moe_a2a_backend="megamoe",
+            tp_size=8,
+            ep_size=1,
+            enable_two_batch_overlap=True,
+            moe_runner_backend="triton",
+        )
+
+        with self.assertRaisesRegex(ValueError, "two-batch-overlap"):
+            ServerArgs._handle_a2a_moe(args)
+
     def test_prepare_server_args(self):
         server_args = prepare_server_args(
             [

@@ -824,9 +824,14 @@ class Envs:
     # Unified radix cache
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(False)
 
-    # DeepGemm Mega MoE
+    # Mega MoE
     SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(1024)
+
+    # FlyDSL MegaMoE (ROCm/gfx95x). The workspace is shared by compatible
+    # layers, but its capacity is fixed when the first layer initializes it.
+    SGLANG_FLYDSL_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(4096)
+    SGLANG_FLYDSL_MEGA_MOE_STAGE2_P2P_QUANT = EnvStr("auto")
 
     # When set, the mega-MoE x slot is packed E2M1 (FP4) instead of FP8 E4M3.
     # Halves symm-buffer footprint and unlocks the MXF4 mainloop downstream.

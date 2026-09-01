@@ -3771,12 +3771,32 @@ class ServerArgs:
 
         if self.moe_a2a_backend == "megamoe":
             self.ep_size = self.tp_size
-            if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
-                envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
-            logger.info(
-                f"Mega MoE is enabled. The expert parallel size is adjusted "
-                f"to be the same as the tensor parallel size[{self.tp_size}]."
-            )
+            if is_hip():
+                if self.enable_two_batch_overlap:
+                    raise ValueError(
+                        "FlyDSL MegaMoE does not yet support "
+                        "--enable-two-batch-overlap"
+                    )
+                if self.moe_runner_backend not in ("auto", "triton"):
+                    raise ValueError(
+                        "FlyDSL MegaMoE on ROCm requires --moe-runner-backend triton"
+                    )
+                # The runner is constructed for compatibility but bypassed by
+                # the fused FlyDSL dispatch/GEMM/combine path.
+                self.moe_runner_backend = "triton"
+                logger.info(
+                    "FlyDSL MegaMoE is enabled on ROCm. The expert parallel "
+                    "size is adjusted to tensor parallel size[%d].",
+                    self.tp_size,
+                )
+            else:
+                if not envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.is_set():
+                    envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.set(True)
+                logger.info(
+                    "DeepGEMM MegaMoE is enabled. The expert parallel size is "
+                    "adjusted to tensor parallel size[%d].",
+                    self.tp_size,
+                )
 
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
@@ -4823,8 +4843,8 @@ class ServerArgs:
         parser.add_argument(
             "--enable-multimodal",
             default=ServerArgs.enable_multimodal,
-            action="store_true",
-            help="Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
+            action=argparse.BooleanOptionalAction,
+            help="Enable or disable multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
         )
         parser.add_argument(
             "--revision",

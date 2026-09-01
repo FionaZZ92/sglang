@@ -1161,6 +1161,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_input_scale = None
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if (
+            _is_hip
+            and get_moe_a2a_backend().is_megamoe()
+            and getattr(layer, "_use_flydsl_mega_moe", False)
+        ):
+            from sglang.srt.layers.moe.mega_moe import (
+                build_flydsl_mega_moe_experts_weights,
+            )
+
+            build_flydsl_mega_moe_experts_weights(layer)
+            return
+
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
         if _use_aiter and self.is_fp4_expert:
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
