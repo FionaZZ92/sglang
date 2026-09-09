@@ -3,7 +3,7 @@
 import unittest
 from types import SimpleNamespace
 
-from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.model_config import ModelConfig, is_mimo_v2_mxfp4
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -65,6 +65,39 @@ class TestModelConfigShapes(CustomTestCase):
         self.assertEqual(model_config.v_head_dim, 96)
         self.assertEqual(model_config.swa_head_dim, 64)
         self.assertEqual(model_config.swa_v_head_dim, 48)
+
+    def test_detects_mimo_v2_native_mxfp4_experts(self):
+        config = SimpleNamespace(
+            architectures=["MiMoV2ForCausalLM"],
+            quantization_config={
+                "quant_method": "fp8",
+                "store_dtype": "mxfp4",
+            },
+        )
+
+        self.assertTrue(is_mimo_v2_mxfp4(config))
+
+    def test_regular_mimo_v2_fp8_is_not_mxfp4(self):
+        config = SimpleNamespace(
+            architectures=["MiMoV2ForCausalLM"],
+            quantization_config={
+                "quant_method": "fp8",
+                "store_dtype": "fp8",
+            },
+        )
+
+        self.assertFalse(is_mimo_v2_mxfp4(config))
+
+    def test_mxfp4_storage_marker_is_mimo_specific(self):
+        config = SimpleNamespace(
+            architectures=["MixtralForCausalLM"],
+            quantization_config={
+                "quant_method": "fp8",
+                "store_dtype": "mxfp4",
+            },
+        )
+
+        self.assertFalse(is_mimo_v2_mxfp4(config))
 
 
 if __name__ == "__main__":

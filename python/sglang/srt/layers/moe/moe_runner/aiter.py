@@ -59,6 +59,7 @@ class AiterMoeQuantInfo(MoeQuantInfo):
     hidden_pad: int = 0
     intermediate_pad: int = 0
     swiglu_limit: float = 0.0
+    is_fp4_experts: bool = False
     fused_moe_kwargs: Optional[dict[str, Any]] = None
 
 
@@ -179,8 +180,9 @@ class AiterRunnerCore(MoeRunnerCore):
                     "fused_moe build with a1_scale_is_transposed support"
                 )
             extra["a1_scale_is_transposed"] = True
-        if quant_info.swiglu_limit > 0:
-            # GateMode is only needed for the gpt-oss MXFP4 swiglu_limit path.
+        if quant_info.swiglu_limit > 0 or quant_info.is_fp4_experts:
+            # Native MXFP4 weights use the configured gate/up shuffle regardless
+            # of whether the activation has a clamp.
             # Import lazily so models that don't use it (e.g. DeepSeek-V3 fp8,
             # swiglu_limit==0) still run on aiter builds where this module
             # lives elsewhere / is absent.
@@ -196,7 +198,8 @@ class AiterRunnerCore(MoeRunnerCore):
                 if envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
                 else GateMode.SEPARATED.value
             )
-            extra["swiglu_limit"] = quant_info.swiglu_limit
+            if quant_info.swiglu_limit > 0:
+                extra["swiglu_limit"] = quant_info.swiglu_limit
         if self.config.no_combine:
             extra["no_combine"] = True
 
@@ -361,9 +364,9 @@ def _pre_permute_deepep_to_aiter(
         # AITER fused_moe Clamped-SwiGLU is dispatched with
         # gate_mode=INTERLEAVE, for which AITER picks a bf16/fp8 `q_dtype_a`
         # Refer to https://github.com/ROCm/aiter/blob/a2617c366dc7271a1662ecda2023d19f6ccefcec/aiter/fused_moe.py#L406-L412
-        swiglu_interleave = quant_info.swiglu_limit > 0 and get_bool_env_var(
-            "SGLANG_USE_AITER_MOE_GU_ITLV", "true"
-        )
+        interleaved_mxfp4 = (
+            quant_info.is_fp4_experts or quant_info.swiglu_limit > 0
+        ) and get_bool_env_var("SGLANG_USE_AITER_MOE_GU_ITLV", "true")
 
         if is_w4a4 and a1_scale is not None and not is_fp4_dispatch:
             # W4A4 weights with FP8 dispatch: dequant FP8->BF16 first; the
@@ -372,9 +375,9 @@ def _pre_permute_deepep_to_aiter(
                 hidden_states, a1_scale, num_local_tokens, output_dtype
             )
             a1_scale = None
-        elif is_w4a4 and is_fp4_dispatch and a1_scale is not None and swiglu_interleave:
-            # W4A4 weights + FP4 dispatch on the clamped-SwiGLU/INTERLEAVE
-            # path: AITER expects a bf16/fp8 activation here, not fp4x2.
+        elif is_w4a4 and is_fp4_dispatch and a1_scale is not None and interleaved_mxfp4:
+            # FP4 weights + FP4 dispatch on an INTERLEAVE A8W4 path: AITER
+            # expects a bf16/fp8 activation here, not fp4x2.
             # Dequant FP4->BF16 and let fused_moe re-quantize internally.
             hidden_states = upscale_mxfp4(
                 hidden_states, a1_scale, num_local_tokens, output_dtype

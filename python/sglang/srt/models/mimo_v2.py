@@ -1769,6 +1769,10 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
+                    if name not in params_dict and name.endswith("_weight_scale"):
+                        native_scale_name = f"{name}_inv"
+                        if native_scale_name in params_dict:
+                            name = native_scale_name
                     param = params_dict[name]
                     weight_loader = param.weight_loader
                     weight_loader(

@@ -88,6 +88,26 @@ def test_aiter_runner_forwards_no_combine_and_extra_fused_moe_kwargs(monkeypatch
     assert captured["custom_fused_moe_kwarg"] == "enabled"
 
 
+def test_aiter_runner_sets_gate_mode_for_native_mxfp4(monkeypatch):
+    captured = {}
+
+    def fused_moe(**kwargs):
+        captured.update(kwargs)
+        return kwargs["hidden_states"]
+
+    _install_fake_aiter(monkeypatch, fused_moe)
+    runner = AiterRunnerCore(MoeRunnerConfig(activation="silu"))
+
+    runner.run(
+        _runner_input(),
+        _quant_info(is_fp4_experts=True),
+        running_state={},
+    )
+
+    assert captured["gate_mode"] == "INTERLEAVE"
+    assert "swiglu_limit" not in captured
+
+
 def test_aiter_runner_rejects_no_combine_when_fused_moe_does_not_support_it(
     monkeypatch,
 ):

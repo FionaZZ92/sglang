@@ -219,6 +219,59 @@ def _fp8_blockwise_to_mxfp4(
     )
 
 
+def _is_native_mxfp4_weight(weight: torch.Tensor) -> bool:
+    """Whether ``weight`` uses a byte-packed E2M1 storage dtype."""
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    return weight.dtype in {
+        dtype for dtype in (torch.uint8, torch.int8, fp4_dtype) if dtype is not None
+    }
+
+
+def _native_mxfp4_to_megamoe_layout(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    gate_up: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Preshuffle checkpoint-native MXFP4 weights without requantizing them."""
+    if weight.ndim != 3 or scale.ndim != 3:
+        raise ValueError(
+            "FlyDSL MegaMoE expects 3-D native MXFP4 weights/scales, got "
+            f"weight={tuple(weight.shape)}, scale={tuple(scale.shape)}"
+        )
+    if not weight.is_contiguous() or not scale.is_contiguous():
+        raise ValueError("FlyDSL MegaMoE source weights and scales must be contiguous")
+    if weight.device != scale.device:
+        raise ValueError(
+            "FlyDSL MegaMoE source weights and scales must be on the same device"
+        )
+    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    scale_dtypes = {
+        dtype for dtype in (torch.uint8, torch.int8, e8m0_dtype) if dtype is not None
+    }
+    if not _is_native_mxfp4_weight(weight) or scale.dtype not in scale_dtypes:
+        raise ValueError(
+            "Native MXFP4 weights and E8M0 scales must use packed byte dtypes, got "
+            f"weight={weight.dtype}, scale={scale.dtype}"
+        )
+
+    experts, rows, packed_cols = weight.shape
+    expected_scale_shape = (experts, rows, packed_cols // 16)
+    if packed_cols % 16 or tuple(scale.shape) != expected_scale_shape:
+        raise ValueError(
+            "Unexpected native MXFP4 weight/scale shapes: "
+            f"weight={tuple(weight.shape)}, scale={tuple(scale.shape)}, "
+            f"expected scale={expected_scale_shape}"
+        )
+
+    weight_u8 = weight if weight.dtype == torch.uint8 else weight.view(torch.uint8)
+    scale_u8 = scale if scale.dtype == torch.uint8 else scale.view(torch.uint8)
+    return (
+        _shuffle_mxfp4_weight(weight_u8, experts=experts, gate_up=gate_up),
+        _shuffle_mxfp4_scale(scale_u8, experts=experts, gate_up=gate_up),
+    )
+
+
 def _init_flydsl_mori() -> None:
     global _FLYDSL_MORI_INITIALIZED
     if _FLYDSL_MORI_INITIALIZED:
@@ -311,8 +364,8 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
         if _using_flydsl_mega_moe(moe):
             raise RuntimeError(
                 "FlyDSL MegaMoE was selected, but this MoE layer did not build "
-                "compatible MXFP4 expert weights. The initial integration supports "
-                "block-quantized FP8 routed experts only."
+                "compatible MXFP4 expert weights. Supported sources are native "
+                "MXFP4 or block-quantized FP8 routed experts."
             )
         return False
     if get_is_capture_mode():
@@ -710,55 +763,95 @@ def build_mega_moe_experts_weights(experts) -> None:
 
 
 def build_flydsl_mega_moe_experts_weights(experts) -> None:
-    """Convert local FP8 block-scale experts to FlyDSL MegaMoE MXFP4."""
+    """Prepare native MXFP4 or block-FP8 experts for FlyDSL MegaMoE."""
     if getattr(experts, "_flydsl_mega_moe_weights_built", False):
         return
     if not is_gfx95_supported():
         raise RuntimeError("FlyDSL MegaMoE currently requires a gfx95x GPU")
 
-    block_size = getattr(experts.quant_config, "weight_block_size", None)
-    if block_size is None:
+    # Native E2M1 checkpoint tensors may arrive as raw uint8/int8 storage or
+    # as torch.float4_e2m1fn_x2. FP8 tensors use a distinct float8 dtype.
+    w13_is_mxfp4 = _is_native_mxfp4_weight(experts.w13_weight)
+    w2_is_mxfp4 = _is_native_mxfp4_weight(experts.w2_weight)
+    if w13_is_mxfp4 != w2_is_mxfp4:
         raise ValueError(
-            "FlyDSL MegaMoE currently requires block-quantized FP8 source weights"
+            "FlyDSL MegaMoE requires both expert weights to use the same source "
+            f"format, got w13={experts.w13_weight.dtype}, "
+            f"w2={experts.w2_weight.dtype}"
         )
-    fp8_dtypes = {
-        dtype
-        for dtype in (
-            getattr(torch, "float8_e4m3fn", None),
-            getattr(torch, "float8_e4m3fnuz", None),
-        )
-        if dtype is not None
-    }
-    if (
-        experts.w13_weight.dtype not in fp8_dtypes
-        or experts.w2_weight.dtype not in fp8_dtypes
-    ):
+    native_mxfp4_declared = bool(
+        getattr(experts.quant_config, "is_fp4_experts", False)
+        or getattr(experts.quant_config, "store_dtype", None) == "mxfp4"
+    )
+    if native_mxfp4_declared and not w13_is_mxfp4:
         raise ValueError(
-            "FlyDSL MegaMoE online conversion expects FP8 expert weights, got "
+            "The quantization config declares native MXFP4 experts, but the "
+            "loaded weights are not byte-packed: "
             f"w13={experts.w13_weight.dtype}, w2={experts.w2_weight.dtype}"
         )
 
     from sglang.srt.distributed import get_moe_expert_parallel_rank
 
-    if get_moe_expert_parallel_rank() == 0:
-        logger.warning(
-            "Converting layer %s EP-local expert weights from FP8 blockscale to "
-            "MXFP4 for FlyDSL MegaMoE; validate end-to-end model accuracy after "
-            "this lossy conversion.",
-            experts.layer_id,
+    if w13_is_mxfp4:
+        if get_moe_expert_parallel_rank() == 0:
+            logger.info(
+                "Using checkpoint-native MXFP4 expert weights for FlyDSL "
+                "MegaMoE layer %s; applying layout shuffle only.",
+                experts.layer_id,
+            )
+        w13, s13 = _native_mxfp4_to_megamoe_layout(
+            experts.w13_weight.data,
+            experts.w13_weight_scale_inv.data,
+            gate_up=True,
         )
-    w13, s13 = _fp8_blockwise_to_mxfp4(
-        experts.w13_weight.data,
-        experts.w13_weight_scale_inv.data,
-        block_size,
-        gate_up=True,
-    )
-    w2, s2 = _fp8_blockwise_to_mxfp4(
-        experts.w2_weight.data,
-        experts.w2_weight_scale_inv.data,
-        block_size,
-        gate_up=False,
-    )
+        w2, s2 = _native_mxfp4_to_megamoe_layout(
+            experts.w2_weight.data,
+            experts.w2_weight_scale_inv.data,
+            gate_up=False,
+        )
+    else:
+        block_size = getattr(experts.quant_config, "weight_block_size", None)
+        if block_size is None:
+            raise ValueError(
+                "FlyDSL MegaMoE requires native MXFP4 or block-quantized FP8 "
+                "source weights"
+            )
+        fp8_dtypes = {
+            dtype
+            for dtype in (
+                getattr(torch, "float8_e4m3fn", None),
+                getattr(torch, "float8_e4m3fnuz", None),
+            )
+            if dtype is not None
+        }
+        if (
+            experts.w13_weight.dtype not in fp8_dtypes
+            or experts.w2_weight.dtype not in fp8_dtypes
+        ):
+            raise ValueError(
+                "FlyDSL MegaMoE expects native MXFP4 or FP8 expert weights, got "
+                f"w13={experts.w13_weight.dtype}, w2={experts.w2_weight.dtype}"
+            )
+
+        if get_moe_expert_parallel_rank() == 0:
+            logger.warning(
+                "Converting layer %s EP-local expert weights from FP8 blockscale "
+                "to MXFP4 for FlyDSL MegaMoE; validate end-to-end model accuracy "
+                "after this lossy conversion.",
+                experts.layer_id,
+            )
+        w13, s13 = _fp8_blockwise_to_mxfp4(
+            experts.w13_weight.data,
+            experts.w13_weight_scale_inv.data,
+            block_size,
+            gate_up=True,
+        )
+        w2, s2 = _fp8_blockwise_to_mxfp4(
+            experts.w2_weight.data,
+            experts.w2_weight_scale_inv.data,
+            block_size,
+            gate_up=False,
+        )
 
     experts.w13_weight = torch.nn.Parameter(w13, requires_grad=False)
     experts.w13_weight_scale_inv = torch.nn.Parameter(s13, requires_grad=False)

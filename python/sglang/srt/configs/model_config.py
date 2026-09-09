@@ -100,6 +100,22 @@ def _hf_attr(config, name):
     return getattr(config, name, None)
 
 
+def _quant_config_to_dict(quant_config):
+    if quant_config is not None and not isinstance(quant_config, dict):
+        return quant_config.to_dict()
+    return quant_config
+
+
+def is_mimo_v2_mxfp4(config) -> bool:
+    quantization_config = _quant_config_to_dict(_hf_attr(config, "quantization_config"))
+    return (
+        _hf_arch(config) in MIMO_V2_MODEL_ARCHS
+        and isinstance(quantization_config, dict)
+        and quantization_config.get("quant_method") == "fp8"
+        and quantization_config.get("store_dtype") == "mxfp4"
+    )
+
+
 def is_deepseek_dsa(config) -> bool:
     return (
         _hf_arch(config)
@@ -251,10 +267,15 @@ class ModelConfig:
         # Config draft model
         self._config_draft_model()
 
+        # Mixed FP8/MXFP4 checkpoints can store only their routed experts in
+        # packed MXFP4 while keeping the rest of the model in FP8/BF16.
+        self.is_fp4_experts: bool = is_mimo_v2_mxfp4(self.hf_config)
+        if self.is_fp4_experts:
+            logger.info("Detected MiMo-V2 native MXFP4 routed experts.")
+
         # DSV4 expert layout: env (default True = mxfp4) applies only to V4.
         # Other FP8 MoE models (for example DeepSeek V3.2) must keep the normal
         # FP8 expert tensor layout.
-        self.is_fp4_experts: bool = False
         if is_deepseek_v4(self.hf_config):
             self.is_fp4_experts = envs.SGLANG_DSV4_FP4_EXPERTS.get()
             if not envs.SGLANG_DSV4_FP4_EXPERTS.is_set():
