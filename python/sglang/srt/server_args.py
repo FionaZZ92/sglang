@@ -1953,6 +1953,7 @@ class ServerArgs:
 
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import (
+            can_mimo_v2_fused_qkv_reshard,
             get_mimo_v2_fused_qkv_expected_tp_size,
             is_deepseek_dsa,
         )
@@ -2409,20 +2410,22 @@ class ServerArgs:
                 )
                 if (
                     expected_attn_tp_size is not None
-                    and effective_attn_tp_size != expected_attn_tp_size
+                    and not can_mimo_v2_fused_qkv_reshard(
+                        expected_attn_tp_size, effective_attn_tp_size
+                    )
                 ):
                     raise ValueError(
-                        "MiMoV2ForCausalLM requires effective attention TP "
-                        f"size {expected_attn_tp_size} because its fused "
-                        "qkv_proj weights are "
-                        f"TP={expected_attn_tp_size}-interleaved; got "
+                        "MiMoV2ForCausalLM fused qkv_proj weights are "
+                        f"TP={expected_attn_tp_size}-interleaved and only "
+                        "support effective attention TP sizes that evenly "
+                        f"divide {expected_attn_tp_size}; got "
                         f"{effective_attn_tp_size} "
                         f"(tp_size={self.tp_size}, dp_size={self.dp_size}, "
                         f"enable_dp_attention={self.enable_dp_attention}, "
                         f"attn_cp_size={self.attn_cp_size}). "
                         "Set --tp, --dp, --enable-dp-attention, and "
                         "--attention-context-parallel-size so the effective "
-                        f"attention TP size is {expected_attn_tp_size}."
+                        "attention TP size is a supported divisor."
                     )
 
             if self.speculative_algorithm == "EAGLE":

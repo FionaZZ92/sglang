@@ -71,6 +71,23 @@ def get_mimo_v2_fused_qkv_expected_tp_size(hf_config):
     return num_key_value_heads
 
 
+def can_mimo_v2_fused_qkv_reshard(
+    source_tp_size: Optional[int], target_tp_size: int
+) -> bool:
+    """Whether a rank-major fused-QKV checkpoint can be coarsened to target TP.
+
+    MiMo-V2 fused-QKV checkpoints concatenate independently quantized source-TP
+    shards. Coarsening can combine an integral number of adjacent source
+    shards; refining the checkpoint layout would additionally require KV-head
+    replication and is intentionally not supported here.
+    """
+    return source_tp_size is None or (
+        target_tp_size > 0
+        and target_tp_size <= source_tp_size
+        and source_tp_size % target_tp_size == 0
+    )
+
+
 class AttentionArch(IntEnum):
     MLA = auto()
     MHA = auto()

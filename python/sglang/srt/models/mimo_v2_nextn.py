@@ -98,6 +98,7 @@ class MiMoV2MTPLayer(nn.Module):
             # The speculative draft worker deliberately keeps an NHD cache;
             # its attention kernels still require matching K/V widths.
             force_v_pad=True,
+            fused_qkv_source_tp_size=get_mimo_v2_fused_qkv_expected_tp_size(config),
             prefix=add_prefix("self_attn", prefix),
         )
         self.is_layer_sparse = False
@@ -312,8 +313,10 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
 
             # Support fused qkv_proj checkpoint (Pro format)
             if "qkv_proj" in name:
-                if name in params_dict:
-                    param = params_dict[name]
+                param = params_dict.get(name)
+                if param is None and name.endswith(".weight_scale_inv"):
+                    param = params_dict.get(name.removesuffix("_scale_inv"))
+                if param is not None:
                     load_mimo_v2_qkv_proj_weight(
                         name,
                         param,

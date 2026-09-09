@@ -51,6 +51,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -64,6 +65,7 @@ from sglang.srt.layers.moe import (
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -185,9 +187,292 @@ def _mimo_model_uses_native_v_cache(*, config, server_args) -> bool:
     )
 
 
+def _mimo_fused_qkv_source_shard_sizes(
+    *,
+    total_num_heads: int,
+    total_num_kv_heads: int,
+    head_size: int,
+    v_head_size: int,
+    source_tp_size: int,
+) -> Tuple[int, int, int]:
+    if source_tp_size <= 0:
+        raise ValueError(f"source_tp_size must be positive, got {source_tp_size}")
+    if total_num_heads % source_tp_size != 0:
+        raise ValueError(
+            f"num_attention_heads={total_num_heads} must be divisible by fused "
+            f"qkv source TP={source_tp_size}."
+        )
+    if total_num_kv_heads % source_tp_size != 0:
+        raise ValueError(
+            f"num_key_value_heads={total_num_kv_heads} must be divisible by "
+            f"fused qkv source TP={source_tp_size}."
+        )
+    return (
+        total_num_heads // source_tp_size * head_size,
+        total_num_kv_heads // source_tp_size * head_size,
+        total_num_kv_heads // source_tp_size * v_head_size,
+    )
+
+
+def _select_mimo_fused_qkv_source_shards(
+    loaded_weight: torch.Tensor,
+    *,
+    source_tp_size: int,
+    target_tp_size: int,
+    target_tp_rank: int,
+    source_shard_size: int,
+) -> torch.Tensor:
+    """Select the adjacent source-TP shards owned by one target TP rank."""
+    if target_tp_size <= 0 or source_tp_size % target_tp_size != 0:
+        raise ValueError(
+            f"Cannot coarsen fused qkv source TP={source_tp_size} to target "
+            f"TP={target_tp_size}."
+        )
+    if not 0 <= target_tp_rank < target_tp_size:
+        raise ValueError(
+            f"target_tp_rank must be in [0, {target_tp_size}), got {target_tp_rank}."
+        )
+    expected_rows = source_tp_size * source_shard_size
+    if loaded_weight.ndim == 0 or loaded_weight.shape[0] != expected_rows:
+        raise ValueError(
+            "MiMoV2 fused qkv checkpoint tensor has unexpected leading "
+            f"dimension {tuple(loaded_weight.shape)}; expected {expected_rows} rows."
+        )
+
+    source_shards_per_rank = source_tp_size // target_tp_size
+    source_start = target_tp_rank * source_shards_per_rank
+    return loaded_weight.unflatten(0, (source_tp_size, source_shard_size)).narrow(
+        0, source_start, source_shards_per_rank
+    )
+
+
+@torch.no_grad()
+def _materialize_mimo_fused_qkv_bf16_weight(
+    param: nn.Parameter,
+    loaded_weight: torch.Tensor,
+    loaded_scale: torch.Tensor,
+) -> None:
+    """Dequantize source shards independently into canonical target-local QKV."""
+    source_tp_size = param.mimo_fused_qkv_source_tp_size
+    target_tp_size = param.mimo_fused_qkv_target_tp_size
+    target_tp_rank = param.mimo_fused_qkv_target_tp_rank
+    source_q_size = param.mimo_fused_qkv_source_q_size
+    source_k_size = param.mimo_fused_qkv_source_k_size
+    source_v_size = param.mimo_fused_qkv_source_v_size
+    source_shard_size = source_q_size + source_k_size + source_v_size
+    block_size = param.mimo_fused_qkv_weight_block_size
+    block_n, block_k = block_size
+    source_scale_rows = (source_shard_size + block_n - 1) // block_n
+
+    selected_weight = _select_mimo_fused_qkv_source_shards(
+        loaded_weight,
+        source_tp_size=source_tp_size,
+        target_tp_size=target_tp_size,
+        target_tp_rank=target_tp_rank,
+        source_shard_size=source_shard_size,
+    )
+    selected_scale = _select_mimo_fused_qkv_source_shards(
+        loaded_scale,
+        source_tp_size=source_tp_size,
+        target_tp_size=target_tp_size,
+        target_tp_rank=target_tp_rank,
+        source_shard_size=source_scale_rows,
+    )
+    expected_scale_cols = (loaded_weight.shape[1] + block_k - 1) // block_k
+    if selected_scale.ndim != 3 or selected_scale.shape[2] != expected_scale_cols:
+        raise ValueError(
+            "MiMoV2 fused qkv scale tensor has unexpected shape "
+            f"{tuple(loaded_scale.shape)}; expected "
+            f"({source_tp_size * source_scale_rows}, {expected_scale_cols})."
+        )
+
+    source_shards_per_rank = source_tp_size // target_tp_size
+    expected_param_shape = (
+        source_shards_per_rank * source_shard_size,
+        loaded_weight.shape[1],
+    )
+    if tuple(param.shape) != expected_param_shape:
+        raise ValueError(
+            f"MiMoV2 coarsened qkv parameter has shape {tuple(param.shape)}; "
+            f"expected {expected_param_shape}."
+        )
+
+    q_total = source_shards_per_rank * source_q_size
+    k_total = source_shards_per_rank * source_k_size
+    for source_shard in range(source_shards_per_rank):
+        dequantized = block_quant_dequant(
+            selected_weight[source_shard].to(device=param.device),
+            selected_scale[source_shard].to(device=param.device),
+            block_size,
+            param.dtype,
+        )
+        q_end = source_q_size
+        k_end = q_end + source_k_size
+        v_end = k_end + source_v_size
+        param.data.narrow(0, source_shard * source_q_size, source_q_size).copy_(
+            dequantized[:q_end]
+        )
+        param.data.narrow(
+            0, q_total + source_shard * source_k_size, source_k_size
+        ).copy_(dequantized[q_end:k_end])
+        param.data.narrow(
+            0,
+            q_total + k_total + source_shard * source_v_size,
+            source_v_size,
+        ).copy_(dequantized[k_end:v_end])
+
+
+class MiMoV2FusedQKVParallelLinear(ColumnParallelLinear):
+    """BF16 fallback for coarsening rank-major fused-QKV checkpoints.
+
+    Every source-TP shard was block-quantized independently. The loader
+    dequantizes each source shard with its own scale grid, regroups the result
+    into canonical target-local Q || K || V order, and stores one BF16 matrix.
+    TP=8 continues to use the original FP8 QKVParallelLinear path.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        head_size: int,
+        total_num_heads: int,
+        total_num_kv_heads: int,
+        source_tp_size: int,
+        *,
+        v_head_size: Optional[int] = None,
+        bias: bool = False,
+        quant_config: Optional[QuantizationConfig] = None,
+        tp_rank: int,
+        tp_size: int,
+        prefix: str = "",
+    ) -> None:
+        if bias:
+            raise ValueError("MiMoV2 fused qkv coarsening does not support bias.")
+        if source_tp_size <= tp_size or source_tp_size % tp_size != 0:
+            raise ValueError(
+                f"Fused qkv source TP={source_tp_size} cannot be coarsened to "
+                f"attention TP={tp_size}."
+            )
+
+        self.source_tp_size = source_tp_size
+        self.target_tp_rank = tp_rank
+        self.target_tp_size = tp_size
+        self.source_shards_per_rank = source_tp_size // tp_size
+        self.v_head_size = v_head_size if v_head_size is not None else head_size
+        (
+            self.source_q_size,
+            self.source_k_size,
+            self.source_v_size,
+        ) = _mimo_fused_qkv_source_shard_sizes(
+            total_num_heads=total_num_heads,
+            total_num_kv_heads=total_num_kv_heads,
+            head_size=head_size,
+            v_head_size=self.v_head_size,
+            source_tp_size=source_tp_size,
+        )
+        self.source_shard_size = (
+            self.source_q_size + self.source_k_size + self.source_v_size
+        )
+
+        weight_block_size = getattr(quant_config, "weight_block_size", None)
+        if getattr(quant_config, "is_checkpoint_fp8_serialized", False) and not (
+            weight_block_size is not None and len(weight_block_size) == 2
+        ):
+            raise ValueError(
+                "MiMoV2 fused qkv coarsening requires block-quantized FP8 "
+                "checkpoint weights."
+            )
+        self.source_weight_block_size = (
+            tuple(int(x) for x in weight_block_size)
+            if weight_block_size is not None
+            else None
+        )
+
+        super().__init__(
+            input_size=hidden_size,
+            output_size=source_tp_size * self.source_shard_size,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            quant_config=None,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            prefix=prefix,
+        )
+
+        self.weight.mimo_fused_qkv_source_tp_size = self.source_tp_size
+        self.weight.mimo_fused_qkv_target_tp_size = self.target_tp_size
+        self.weight.mimo_fused_qkv_target_tp_rank = self.target_tp_rank
+        self.weight.mimo_fused_qkv_source_q_size = self.source_q_size
+        self.weight.mimo_fused_qkv_source_k_size = self.source_k_size
+        self.weight.mimo_fused_qkv_source_v_size = self.source_v_size
+        self.weight.mimo_fused_qkv_weight_block_size = self.source_weight_block_size
+
+    def forward_qkv(self, input_) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if isinstance(input_, tuple):
+            raise ValueError("BF16 fused qkv fallback expects unquantized input.")
+        projected, _ = super().forward(input_)
+        q_size = self.source_shards_per_rank * self.source_q_size
+        k_size = self.source_shards_per_rank * self.source_k_size
+        v_size = self.source_shards_per_rank * self.source_v_size
+        return projected.split((q_size, k_size, v_size), dim=-1)
+
+    def forward(self, input_):
+        return torch.cat(self.forward_qkv(input_), dim=-1), None
+
+
 def load_mimo_v2_qkv_proj_weight(
     name, param, loaded_weight, expected_fused_tp_size: Optional[int] = None
 ):
+    source_tp_size = getattr(param, "mimo_fused_qkv_source_tp_size", None)
+    if source_tp_size is not None:
+        block_size = param.mimo_fused_qkv_weight_block_size
+        if block_size is None:
+            if not name.endswith(".weight"):
+                raise ValueError(f"Unexpected unquantized fused qkv tensor {name}.")
+            source_shard_size = (
+                param.mimo_fused_qkv_source_q_size
+                + param.mimo_fused_qkv_source_k_size
+                + param.mimo_fused_qkv_source_v_size
+            )
+            selected = _select_mimo_fused_qkv_source_shards(
+                loaded_weight,
+                source_tp_size=source_tp_size,
+                target_tp_size=param.mimo_fused_qkv_target_tp_size,
+                target_tp_rank=param.mimo_fused_qkv_target_tp_rank,
+                source_shard_size=source_shard_size,
+            )
+            q_end = param.mimo_fused_qkv_source_q_size
+            k_end = q_end + param.mimo_fused_qkv_source_k_size
+            default_weight_loader(
+                param,
+                torch.cat(
+                    (
+                        selected[:, :q_end].flatten(0, 1),
+                        selected[:, q_end:k_end].flatten(0, 1),
+                        selected[:, k_end:].flatten(0, 1),
+                    ),
+                    dim=0,
+                ),
+            )
+            return
+
+        if name.endswith(".weight_scale_inv"):
+            param.mimo_fused_qkv_pending_scale = loaded_weight
+        elif name.endswith(".weight"):
+            param.mimo_fused_qkv_pending_weight = loaded_weight
+        else:
+            raise ValueError(f"Unexpected block-FP8 fused qkv tensor {name}.")
+
+        pending_weight = getattr(param, "mimo_fused_qkv_pending_weight", None)
+        pending_scale = getattr(param, "mimo_fused_qkv_pending_scale", None)
+        if pending_weight is not None and pending_scale is not None:
+            _materialize_mimo_fused_qkv_bf16_weight(
+                param, pending_weight, pending_scale
+            )
+            del param.mimo_fused_qkv_pending_weight
+            del param.mimo_fused_qkv_pending_scale
+        return
+
     if loaded_weight.shape == param.shape:
         # The checkpoint already stores this rank's qkv_proj shard.
         default_weight_loader(param, loaded_weight)
@@ -612,6 +897,7 @@ class MiMoV2Attention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         partial_rotary_factor: float = 1.0,
         force_v_pad: bool = False,
+        fused_qkv_source_tp_size: Optional[int] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -655,19 +941,37 @@ class MiMoV2Attention(nn.Module):
 
         self.scaling = self.head_dim**-0.5
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            v_head_size=self.original_v_head_dim,
-            bias=attention_bias,
-            quant_config=quant_config,
-            tp_rank=attn_tp_rank,
-            tp_size=attn_tp_size,
-            prefix=add_prefix("qkv_proj", prefix),
-            skip_block_quant_check=True,
-        )
+        if (
+            fused_qkv_source_tp_size is not None
+            and fused_qkv_source_tp_size != attn_tp_size
+        ):
+            self.qkv_proj = MiMoV2FusedQKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                fused_qkv_source_tp_size,
+                v_head_size=self.original_v_head_dim,
+                bias=attention_bias,
+                quant_config=quant_config,
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
+                prefix=add_prefix("qkv_proj", prefix),
+            )
+        else:
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                v_head_size=self.original_v_head_dim,
+                bias=attention_bias,
+                quant_config=quant_config,
+                tp_rank=attn_tp_rank,
+                tp_size=attn_tp_size,
+                prefix=add_prefix("qkv_proj", prefix),
+                skip_block_quant_check=True,
+            )
 
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.original_v_head_dim,
@@ -711,6 +1015,12 @@ class MiMoV2Attention(nn.Module):
             else None
         )
 
+    def _project_qkv(self, hidden_states):
+        if isinstance(self.qkv_proj, MiMoV2FusedQKVParallelLinear):
+            return self.qkv_proj.forward_qkv(hidden_states)
+        qkv, _ = self.qkv_proj(hidden_states)
+        return qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+
     def op_prepare(self, state):
         state.attn_intermediate_state = self.forward_prepare(
             positions=state.positions,
@@ -731,8 +1041,7 @@ class MiMoV2Attention(nn.Module):
     ):
         if _mimo_hidden_num_tokens(hidden_states) == 0:
             return hidden_states, forward_batch, None
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+        q, k, v = self._project_qkv(hidden_states)
 
         q, k = self.rotary_emb(positions, q, k)
         if self.v_scale is not None:
@@ -767,8 +1076,7 @@ class MiMoV2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.k_size, self.v_size], dim=-1)
+        q, k, v = self._project_qkv(hidden_states)
 
         # [t, h, dr]
         q, k = self.rotary_emb(positions, q, k)
@@ -825,6 +1133,7 @@ class MiMoV2DecoderLayer(nn.Module):
             config=config,
             server_args=get_global_server_args(),
         )
+        fused_qkv_source_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(config)
 
         if self.is_swa_layer():
             self.self_attn = MiMoV2Attention(
@@ -846,6 +1155,7 @@ class MiMoV2DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
                 force_v_pad=force_v_pad,
+                fused_qkv_source_tp_size=fused_qkv_source_tp_size,
                 prefix=add_prefix("self_attn", prefix),
             )
         else:
@@ -868,6 +1178,7 @@ class MiMoV2DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 partial_rotary_factor=getattr(config, "partial_rotary_factor", 1.0),
                 force_v_pad=force_v_pad,
+                fused_qkv_source_tp_size=fused_qkv_source_tp_size,
                 prefix=add_prefix("self_attn", prefix),
             )
 
@@ -1732,8 +2043,10 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
 
             # Support fused qkv_proj checkpoint (Pro format)
             if "qkv_proj" in name:
-                if name in params_dict:
-                    param = params_dict[name]
+                param = params_dict.get(name)
+                if param is None and name.endswith(".weight_scale_inv"):
+                    param = params_dict.get(name.removesuffix("_scale_inv"))
+                if param is not None:
                     expected_fused_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(
                         self.config
                     )
