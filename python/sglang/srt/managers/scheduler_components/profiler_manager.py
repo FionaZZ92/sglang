@@ -215,7 +215,10 @@ class SchedulerProfilerManager:
                     )
                 ),
                 experimental_config=(
-                    None
+                    # with_stack records Python activities, while Kineto's
+                    # verbose mode also embeds the source stack in each CPU op
+                    # so Chrome/Perfetto can show it in the event details.
+                    torch.profiler._ExperimentalConfig(verbose=bool(with_stack))
                     if not _is_npu
                     else torch_npu.profiler._ExperimentalConfig(
                         export_type=torch_npu.profiler.ExportType.Text,

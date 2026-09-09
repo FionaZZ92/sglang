@@ -198,9 +198,14 @@ def prepare_mlp_sync_batch_raw(
         local_batch.is_extend_in_batch = is_extend_in_batch
 
     tbo_preparer = TboDPAttentionPreparer()
-    if len(offload_tags) == 0 and (
-        disable_overlap_schedule
-        or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
+    force_cpu_all_gather = envs.SGLANG_SCHEDULER_FORCE_CPU_ALL_GATHER.get()
+    if (
+        not force_cpu_all_gather
+        and len(offload_tags) == 0
+        and (
+            disable_overlap_schedule
+            or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
+        )
     ):
         group = tp_group.device_group
         device = tp_group.device

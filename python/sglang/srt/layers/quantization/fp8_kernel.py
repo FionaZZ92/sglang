@@ -37,6 +37,7 @@ from sglang.srt.utils import (
     get_device_name,
     is_cpu,
     is_cuda,
+    is_gfx95_supported,
     is_hip,
     is_musa,
     is_sm100_supported,
@@ -48,6 +49,7 @@ from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_gfx95_supported = is_gfx95_supported()
 _is_cpu = is_cpu()
 _is_musa = is_musa()
 _is_sm100_supported = is_sm100_supported()
@@ -892,6 +894,9 @@ def _w8a8_block_fp8_matmul(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     needs_masking: tl.constexpr,
+    M_ALIGNED: tl.constexpr,
+    N_ALIGNED: tl.constexpr,
+    SCALE_EVERY_K_TILE: tl.constexpr,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and store the result in output
@@ -901,15 +906,24 @@ def _w8a8_block_fp8_matmul(
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
+    if GROUP_SIZE_M == 1:
+        pid_m = pid // num_pid_n
+        pid_n = pid % num_pid_n
+    else:
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + (pid % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
 
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    if not M_ALIGNED:
+        offs_am %= M
+
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    if not N_ALIGNED:
+        offs_bn %= N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
@@ -917,7 +931,8 @@ def _w8a8_block_fp8_matmul(
     As_ptrs = As + offs_am * stride_As_m
     offs_bsn = offs_bn // group_n
     Bs_ptrs = Bs + offs_bsn * stride_Bs_n
-    n_tiles_k_per_group_k = group_k // BLOCK_SIZE_K
+    if not SCALE_EVERY_K_TILE:
+        n_tiles_k_per_group_k = group_k // BLOCK_SIZE_K
 
     accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
@@ -931,7 +946,10 @@ def _w8a8_block_fp8_matmul(
         a_s = tl.load(As_ptrs)
         b_s = tl.load(Bs_ptrs)
 
-        scale_step_k = tl.where((k + 1) % n_tiles_k_per_group_k == 0, 1, 0)
+        if SCALE_EVERY_K_TILE:
+            scale_step_k = 1
+        else:
+            scale_step_k = tl.where((k + 1) % n_tiles_k_per_group_k == 0, 1, 0)
         accumulator += tl.dot(a, b) * a_s[:, None] * b_s[None, :]
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -945,10 +963,19 @@ def _w8a8_block_fp8_matmul(
     else:
         c = accumulator.to(tl.float32)
 
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    if M_ALIGNED:
+        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        row_mask = tl.full((BLOCK_SIZE_M,), True, dtype=tl.int1)
+    else:
+        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        row_mask = offs_cm < M
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    if N_ALIGNED:
+        col_mask = tl.full((BLOCK_SIZE_N,), True, dtype=tl.int1)
+    else:
+        col_mask = offs_cn < N
+    c_mask = row_mask[:, None] & col_mask[None, :]
     tl.store(c_ptrs, c, mask=c_mask)
 
 
@@ -984,6 +1011,9 @@ def _w8a8_block_fp8_matmul_unrolledx4(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     needs_masking: tl.constexpr,
+    M_ALIGNED: tl.constexpr,
+    N_ALIGNED: tl.constexpr,
+    SCALE_EVERY_K_TILE: tl.constexpr,
 ):
     """Triton-accelerated function used to perform linear operations (dot
     product) on input tensors `A` and `B` with block-wise quantization, and store the result in output
@@ -993,15 +1023,24 @@ def _w8a8_block_fp8_matmul_unrolledx4(
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
+    if GROUP_SIZE_M == 1:
+        pid_m = pid // num_pid_n
+        pid_n = pid % num_pid_n
+    else:
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + (pid % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
 
-    offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+    offs_am = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    if not M_ALIGNED:
+        offs_am %= M
+
+    offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    if not N_ALIGNED:
+        offs_bn %= N
     offs_k = tl.arange(0, BLOCK_SIZE_K)
     a_ptrs = A + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
     b_ptrs = B + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
@@ -1122,10 +1161,19 @@ def _w8a8_block_fp8_matmul_unrolledx4(
     else:
         c = accumulator.to(tl.float32)
 
-    offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+    if M_ALIGNED:
+        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        row_mask = tl.full((BLOCK_SIZE_M,), True, dtype=tl.int1)
+    else:
+        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        row_mask = offs_cm < M
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = C + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
-    c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+    if N_ALIGNED:
+        col_mask = tl.full((BLOCK_SIZE_N,), True, dtype=tl.int1)
+    else:
+        col_mask = offs_cn < N
+    c_mask = row_mask[:, None] & col_mask[None, :]
     tl.store(c_ptrs, c, mask=c_mask)
 
 
@@ -1307,6 +1355,8 @@ def w8a8_block_fp8_matmul_triton(
     """
 
     M, N, K, C = prepare_block_fp8_matmul_inputs(A, B, As, Bs, block_size, output_dtype)
+    original_m = M
+    original_c_shape = C.shape
 
     block_n, block_k = block_size
 
@@ -1326,6 +1376,28 @@ def w8a8_block_fp8_matmul_triton(
             "num_warps": 4,
             "num_stages": 3,
         }
+
+    # Triton's gfx950 pointer canonicalization currently fails for a partial
+    # single M tile in this kernel. Padding only A/As and the output to one
+    # complete tile avoids the problematic masked pointer path without
+    # dequantizing the much larger B matrix.
+    if _is_gfx95_supported and M < config["BLOCK_SIZE_M"]:
+        padded_m = config["BLOCK_SIZE_M"]
+        A_padded = A.new_zeros((padded_m, K))
+        As_padded = As.new_zeros((padded_m, As.shape[-1]))
+        A_padded[:M].copy_(A.reshape(M, K))
+        As_padded[:M].copy_(As.reshape(M, As.shape[-1]))
+        A = A_padded
+        As = As_padded
+        C = A.new_empty((padded_m, N), dtype=output_dtype)
+        M = padded_m
+
+    if (
+        _is_gfx95_supported
+        and M <= config["BLOCK_SIZE_M"]
+        and config["GROUP_SIZE_M"] != 1
+    ):
+        config = {**config, "GROUP_SIZE_M": 1}
 
     needs_masking = bool(K % config["BLOCK_SIZE_K"] != 0)
 
@@ -1357,10 +1429,15 @@ def w8a8_block_fp8_matmul_triton(
         As.stride(-1),
         Bs.stride(1),
         Bs.stride(0),
+        M_ALIGNED=_is_gfx95_supported and M % config["BLOCK_SIZE_M"] == 0,
+        N_ALIGNED=_is_gfx95_supported and N % config["BLOCK_SIZE_N"] == 0,
+        SCALE_EVERY_K_TILE=(_is_gfx95_supported and config["BLOCK_SIZE_K"] == block_k),
         **config,
         needs_masking=needs_masking,
     )
 
+    if M != original_m:
+        return C[:original_m].reshape(original_c_shape)
     return C
 
 

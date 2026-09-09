@@ -331,6 +331,11 @@ class Envs:
     SGLANG_RADIX_FORCE_MISS = EnvBool(False)
     SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR = EnvFloat(0.75)
     SGLANG_SCHEDULER_SKIP_ALL_GATHER = EnvBool(False)
+    # Keep DP-attention scheduler metadata synchronization on the host even
+    # when overlap scheduling is disabled. This is useful for profiling
+    # collective-heavy ROCm runs without inserting the scheduler rendezvous
+    # into the model's GPU stream.
+    SGLANG_SCHEDULER_FORCE_CPU_ALL_GATHER = EnvBool(False)
     SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE = EnvBool(False)
     SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)
     SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(None)
