@@ -4,13 +4,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 EVALUATION_DIR="$(dirname -- "${SCRIPT_DIR}")"
 SGLANG_ROOT="${SGLANG_ROOT:-$(dirname -- "${EVALUATION_DIR}")}"
-AITER_ROOT="${AITER_ROOT:-/root/workspace/aiter-mimo-fp4-dflash}"
+AITER_ROOT="${AITER_ROOT:-/sgl-workspace/aiter}"
 export PYTHONPATH="${SGLANG_ROOT}/python:${AITER_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
 export AITER_CONFIG_GEMM_A8W8_BLOCKSCALE="${AITER_CONFIG_GEMM_A8W8_BLOCKSCALE:-${AITER_ROOT}/aiter/configs/model_configs/a8w8_blockscale_tuned_gemm_mimo_v2_5_pro.csv}"
 export AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE="${AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE:-${AITER_ROOT}/aiter/configs/model_configs/a8w8_blockscale_bpreshuffle_tuned_gemm_mimo_v2_5_pro.csv}"
 
-TARGET_MODEL_VARIANT="${TARGET_MODEL_VARIANT:-fp8}"
+TARGET_MODEL_VARIANT="${TARGET_MODEL_VARIANT:-mxfp4}"
 case "${TARGET_MODEL_VARIANT}" in
   fp8)
     export MODEL="${MODEL:-/models/MiMo-V2.5-Pro}"
@@ -29,7 +29,7 @@ case "${TARGET_MODEL_VARIANT}" in
 esac
 
 export AITER_CONFIG_FMOE="${AITER_CONFIG_FMOE:-${default_fmoe_config}}"
-export AITER_MXFP4_STAGE2_OUTPUT_DTYPE="${AITER_MXFP4_STAGE2_OUTPUT_DTYPE:-fp8}"
+export AITER_MXFP4_STAGE2_OUTPUT_DTYPE="${AITER_MXFP4_STAGE2_OUTPUT_DTYPE:-bf16}"
 export HOST="${HOST:-0.0.0.0}"
 export PORT="${PORT:-30001}"
 export MOE_RUNNER_BACKEND="${MOE_RUNNER_BACKEND:-aiter}"

@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 
-export MODEL="${MODEL:-/models/MiMo-V2.5-Pro}"
+export MODEL="${MODEL:-/models/MiMo-V2.5-Pro-FP4-DFlash}"
 export HOST="${HOST:-127.0.0.1}"
 export PORT="${PORT:-30001}"
 export DATASET_PATH="${DATASET_PATH:-${REPO_ROOT}/scripts/ShareGPT_V3_unfiltered_cleaned_split.json}"
@@ -17,7 +17,7 @@ export WARMUP_REQUESTS="${WARMUP_REQUESTS:-32}"
 # NUM_PROMPTS override remains available for a deliberately longer run.
 export PROMPT_WAVES="${PROMPT_WAVES:-4}"
 export NUM_PROMPTS="${NUM_PROMPTS:-}"
-export BENCHMARK_PRESET="${BENCHMARK_PRESET:-customer}"
+export BENCHMARK_PRESET="${BENCHMARK_PRESET:-baseline_highest}"
 DRY_RUN="${DRY_RUN:-0}"
 
 if [[ "${DRY_RUN}" != "0" && "${DRY_RUN}" != "1" ]]; then

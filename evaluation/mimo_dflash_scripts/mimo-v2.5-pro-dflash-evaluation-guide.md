@@ -24,7 +24,7 @@ rm -rf /sgl-workspace/sglang /sgl-workspace/aiter
 ### Install sglang
 
 ```bash
-cd /root/workspace
+cd /sgl-workspace
 git clone https://github.com/sammysun0711/sglang -b mimo-opt-mxfp4-dflash
 cd sglang && pip install --upgrade pip && cd sgl-kernel && python3 setup_rocm.py install
 cd ..  && rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml && pip install -e "python[all_hip]"
@@ -37,6 +37,7 @@ cd ..
 git clone https://github.com/sammysun0711/aiter -b integration/mimo-fp4-dflash
 cd aiter
 git submodule update --init 3rdparty/composable_kernel
+git -C 3rdparty/composable_kernel apply < patches/composable_kernel/mimo_page64_qk192_v128_batch_prefill.patch
 pip install -e .
 cd ..
 ```
@@ -56,7 +57,7 @@ Baseline prefill keeps quick-reduce disabled, mixed router disabled, FlyDSL pref
 ### Launch TBO-off server
 
 ```bash
-cd /root/workspace/sglang/evaluation/mimo_dflash_scripts
+cd /sgl-workspace/sglang/evaluation/mimo_dflash_scripts
 MEM_FRACTION_STATIC=0.80 \
 CHUNKED_PREFILL_SIZE=65536 \
 DISABLE_RADIX_CACHE=1 \
@@ -69,7 +70,7 @@ SGLANG_DFLASH_PERFORMANCE_MODE=1 \
 ### Run prefill benchmark
 
 ```bash
-cd /root/workspace/sglang/evaluation/
+cd /sgl-workspace/sglang/evaluation/
 ./run_benchmark_mimo_pro_prefill.sh
 ```
 
@@ -77,7 +78,7 @@ Stop the TBO-off server, verify that the GPUs are clear, then launch a fresh
 TBO-on server and run the same client matrix:
 
 ```bash
-cd /root/workspace/sglang/evaluation/mimo_dflash_scripts
+cd /sgl-workspace/sglang/evaluation/mimo_dflash_scripts
 MEM_FRACTION_STATIC=0.75 \
 CHUNKED_PREFILL_SIZE=65536 \
 DISABLE_RADIX_CACHE=1 \
@@ -114,7 +115,7 @@ more than that reduces the full-token pool without increasing concurrency.
 ### Launch server
 
 ```bash
-cd /root/workspace/sglang/evaluation/mimo_dflash_scripts
+cd /sgl-workspace/sglang/evaluation/mimo_dflash_scripts
 MEM_FRACTION_STATIC=0.85 \
 DISABLE_RADIX_CACHE=1 \
 SWA_FULL_TOKENS_RATIO=0.016 \
@@ -125,7 +126,7 @@ MAX_RUNNING_REQUESTS=286 \
 ### Run the matching decode point
 
 ```bash
-cd /root/workspace/sglang/evaluation
+cd /sgl-workspace/sglang/evaluation
 CASE_SPECS='65532|65536|64k|285' \
 PROMPT_WAVES=4 \
 WARMUP_REQUESTS=32 \
@@ -157,14 +158,14 @@ mean-based reference values.
 ## 5. Profiling & Analysis
 
 ```bash
-cd /root/workspace/sglang/evaluation
+cd /sgl-workspace/sglang/evaluation
 ./run_sglang_profile.sh
 ```
 
 ## 8. Run real-MTP ShareGPT dataset accuracy gate
 
 ```bash
-cd /root/workspace/sglang/evaluation
+cd /sgl-workspace/sglang/evaluation
 ./run_sharegpt_mtp_accuracy_test.sh
 ```
 
