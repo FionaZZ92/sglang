@@ -18,7 +18,7 @@ rm -rf /sgl-workspace/sglang /sgl-workspace/aiter
 
 ### Install sglang
 ```bash
-cd /root/workspace
+cd /sgl-workspace/
 git clone https://github.com/sammysun0711/sglang -b mimo-opt
 cd sglang && pip install --upgrade pip && cd sgl-kernel && python3 setup_rocm.py install
 cd ..  && rm -rf python/pyproject.toml && mv python/pyproject_other.toml python/pyproject.toml && pip install -e "python[all_hip]"
@@ -53,12 +53,11 @@ ibv_devinfo -v | head -30
 git clone https://github.com/sammysun0711/llm-distributed-inference.git
 cd llm-distributed-inference/sglang/
 # On node 0, create remote ssh access in prefill container to node 1 decode container and vice versa
-```bash
-./scripts/setup_docker_passwdless_ssh.sh mi355-gpu-16 
+./scripts/setup_docker_passwdless_ssh.sh mi355-gpu-14
 ```
 checkout that node 0 and node 1 can access via ssh without password.
 ```shell
-ssh mi355-gpu-16
+ssh mi355-gpu-14
 ```
 
 ## 3. Launch PD disagg prefill server on node 0
@@ -66,33 +65,33 @@ Please note: update `SGLANG_HOST_IP`, `MC_GID_INDEX` and `DISAGGREGATION_IB_DEVI
 
 TBO on prefill node is disable by default, enable via `ENABLE_TWO_BATCH_OVERLAP=1`
 ```bash
-cd /root/workspace/sglang/evaluation/mimo_pd_scripts
+cd /sgl-workspace/sglang/evaluation/mimo_pd_scripts
 ./launch_tp8_noep_prefill_aiter_mtp.sh
 ```
 
 ## 4. Launch PD disagg decode server on node 1
 Please note: update `SGLANG_HOST_IP`, `MC_GID_INDEX` and `DISAGGREGATION_IB_DEVICE` based on network settings
 ```bash
-cd /root/workspace/sglang/evaluation/mimo_pd_scripts
+cd /sgl-workspace/sglang/evaluation/mimo_pd_scripts
 ./launch_tp8_noep_decode_aiter_mtp.sh
 ```
 
 ## 5. Launch PD disagg router on node 0
 Please note: update `PREFILL_HOST_IP` and `DECODE_HOST_IP` based on network settings
 ```bash
-cd /root/workspace/sglang/evaluation/mimo_pd_scripts
+cd /sgl-workspace/sglang/evaluation/mimo_pd_scripts
 ./launch_router.sh
 ```
 
 ## 6. Run PD disagg benchmark
 ### Run prefill benchmark on node 0
 ```bash
-cd /root/workspace/sglang/evaluation/mimo_pd_scripts
+cd /sgl-workspace/sglang/evaluation/mimo_pd_scripts
 ./run_benchmark_mimo_pro_prefill.sh
 ```
 
 ### Run decode benchmark on node 0
 ```bash
-cd /root/workspace/sglang/evaluation/mimo_pd_scripts
+cd /sgl-workspace/sglang/evaluation/mimo_pd_scripts
 ./run_benchmark_mimo_pro_decode.sh
 ```

@@ -10,8 +10,9 @@ export SGLANG_SET_CPU_AFFINITY=1
 export HSA_NO_SCRATCH_RECLAIM=1
 
 # Native InfiniBand use GID 0 is valid. GID 1 used for RoCE.
-export SGLANG_HOST_IP="${SGLANG_HOST_IP:-172.16.1.26}"
+export SGLANG_HOST_IP="${SGLANG_HOST_IP:-10.2.80.21}"
 export HOST_IP="${HOST_IP:-${SGLANG_HOST_IP}}"
+
 export MC_GID_INDEX="${MC_GID_INDEX:-1}"
 #export DISAGGREGATION_IB_DEVICE="${DISAGGREGATION_IB_DEVICE:-mlx5_ib0,mlx5_ib1,mlx5_ib2,mlx5_ib3,mlx5_ib4,mlx5_ib5,mlx5_ib6,mlx5_ib7}"
 export DISAGGREGATION_IB_DEVICE="${DISAGGREGATION_IB_DEVICE:-rocep121s0,rocep9s0,rocep105s0,rocep25s0,rocep249s0,rocep137s0,rocep233s0,rocep153s0}"
@@ -52,9 +53,9 @@ export MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-96}"
 export MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.90}"
 # 0.01 overflowed SWA on 65k PD seqs; keep more headroom than the single-node default.
 export SWA_FULL_TOKENS_RATIO="${SWA_FULL_TOKENS_RATIO:-0.2}"
-export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-16384}"
+export CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-32768}"
 export KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-auto}"
-export DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-1}"
+export DISABLE_RADIX_CACHE="${DISABLE_RADIX_CACHE:-0}"
 export ENABLE_TWO_BATCH_OVERLAP="${ENABLE_TWO_BATCH_OVERLAP:-0}"
 export SGLANG_TBO_MIM_SEQ_LEN="${SGLANG_TBO_MIM_SEQ_LEN:-2000}"
 
@@ -68,8 +69,8 @@ unset SGLANG_SIMULATE_ACC_LEN SGLANG_SIMULATE_ACC_METHOD
 
 export MODEL="${MODEL:-/models/MiMo-V2.5-Pro}"
 export RUN_ID="${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
-export LOG_DIR="${LOG_DIR:-/root/workspace/bench_tp8_noep_mooncake}"
-export LOG_FILE="${LOG_FILE:-prefill_server.log}"
+export LOG_DIR="${LOG_DIR:-./logs/server_log-${RUN_ID}}"
+export LOG_FILE="${LOG_FILE:-pd_prefill_server.log}"
 
 echo "Attention hybrid: prefill-flydsl=${SGLANG_FLYDSL_MIMO_PREFILL}, target-verify=${SGLANG_AITER_PA_DECODE_IMPL}, KV-layout=${SGLANG_AITER_KV_CACHE_LAYOUT}"
 echo "Configuration: max-running=${MAX_RUNNING_REQUESTS}, page=64, chunked-prefill=${CHUNKED_PREFILL_SIZE}, mem=${MEM_FRACTION_STATIC}, swa=${SWA_FULL_TOKENS_RATIO}, kv-cache-dtype=${KV_CACHE_DTYPE}"
@@ -131,8 +132,20 @@ python3 -u -m sglang.launch_server \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 4 \
   --enable-multi-layer-eagle \
-  --watchdog-time 1200 \
   --disable-cuda-graph \
+  --log-level-http warning \
+  --watchdog-time 1000000  \
+  --tokenizer-worker-num 64 \
+  --enable-cache-report \
+  --model-loader-extra-config '{"enable_multithread_load": "true","num_threads": 64}' \
+  --collect-tokens-histogram \
+  --enable-metrics \
+  --bucket-time-to-first-token 0.1 0.2 0.4 0.6 0.8 1 2 4 6 8 10 20 40 60 80 100 200 400 800 1200 1800 2400 3600 5400 7200 \
+  --bucket-e2e-request-latency 0.1 0.2 0.4 0.6 0.8 1 2 4 6 8 10 20 40 60 80 100 200 400 600 1200 1800 2400 3600 5400 7200 \
+  --load-balance-method round_robin \
+  --allow-auto-truncate \
+  --enable-metrics-for-all-schedulers \
+  --disable-tokenizer-batch-decode \
   "${tbo_args[@]}" \
   "${radix_cache_args[@]}" \
   "${cuda_graph_args[@]}" \

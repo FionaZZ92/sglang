@@ -6,8 +6,8 @@ set -euo pipefail
 
 # Defaults are the verified host IPs.
 # Override with environment variables when running on a different network.
-PREFILL_HOST_IP="${PREFILL_HOST_IP:-172.16.1.26}"
-DECODE_HOST_IP="${DECODE_HOST_IP:-172.16.1.122}"
+PREFILL_HOST_IP="${PREFILL_HOST_IP:-10.2.80.21}"
+DECODE_HOST_IP="${DECODE_HOST_IP:-10.2.80.29}"
 LOG_DIR="${LOG_DIR:-logs/pd-disagg-router}"
 
 mkdir -p "$LOG_DIR"

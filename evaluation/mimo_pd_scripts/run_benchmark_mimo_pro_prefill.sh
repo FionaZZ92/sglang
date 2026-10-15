@@ -48,7 +48,6 @@ for input_tokens in "${TOKEN_LIST[@]}"; do
         --random-output-len ${output_tokens} \
         --random-range-ratio 1.0 \
         --dataset-path "${SHAREGPT_DATASET}" \
-        --flush-cache \
         --seed 12345 \
         --num-prompts 16 \
         --warmup-requests 1 \
