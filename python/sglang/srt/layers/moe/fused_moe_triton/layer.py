@@ -619,6 +619,11 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: Optional[int],
     ) -> None:
+        if getattr(self, "_mxfp4_to_fp8_converted", False):
+            raise RuntimeError(
+                "Reloading MXFP4 checkpoint weights into converted FP8 MoE "
+                "storage is unsupported; recreate the model before loading"
+            )
         # if expert_id is None, then
         # all the experts are loaded at the same time
         if (
@@ -1002,6 +1007,11 @@ class FusedMoE(torch.nn.Module):
         weight_name: str,
         shard_id: str,
     ) -> None:
+        if getattr(self, "_mxfp4_to_fp8_converted", False):
+            raise RuntimeError(
+                "Reloading MXFP4 checkpoint weights into converted FP8 MoE "
+                "storage is unsupported; recreate the model before loading"
+            )
         tp_rank = self.moe_tp_rank
 
         if (

@@ -627,6 +627,8 @@ class Envs:
     # quantization consumed by its AITER block-scaled FMoE on gfx950. The
     # normalized BF16 output remains available to the FP32 router path.
     SGLANG_MIMO_FUSED_RMS_MOE_QUANT = EnvBool(False)
+    # Convert native MXFP4 expert weights at load time for AITER FP8 block MoE.
+    SGLANG_MXFP4_TO_FP8_128BLOCK = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)
     DISABLE_OPENAPI_DOC = EnvBool(False)
     SGLANG_ENABLE_TORCH_INFERENCE_MODE = EnvBool(False)

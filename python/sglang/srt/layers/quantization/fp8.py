@@ -874,6 +874,28 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
         self.is_fp4_expert = self.quant_config.is_fp4_experts
+        # Snapshot the load-time choice: runtime dispatch changes after conversion,
+        # while the shared checkpoint config must remain MXFP4 for other layers.
+        self.convert_mxfp4_to_fp8 = (
+            self.is_fp4_expert
+            and getattr(quant_config, "store_dtype", "fp8") == "mxfp4"
+            and envs.SGLANG_MXFP4_TO_FP8_128BLOCK.get()
+        )
+        if self.convert_mxfp4_to_fp8:
+            if not (_is_hip and _use_aiter) or _use_hip_int4:
+                raise ValueError(
+                    "SGLANG_MXFP4_TO_FP8_128BLOCK requires ROCm, "
+                    "SGLANG_USE_AITER=1 and SGLANG_INT4_WEIGHT=0"
+                )
+            if (
+                quant_config.weight_block_size != [128, 128]
+                or quant_config.activation_scheme != "dynamic"
+                or self.use_mxfp8
+            ):
+                raise ValueError(
+                    "MXFP4 to FP8 conversion requires weight_block_size=[128, 128] "
+                    "and dynamic FP8 activations (not MXFP8)"
+                )
         self.with_bias = False
         if get_moe_runner_backend().is_cutlass():
             assert (
@@ -912,6 +934,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         **extra_weight_attrs,
     ):
         self.with_bias = with_bias
+        if self.convert_mxfp4_to_fp8:
+            if with_bias or not layer.moe_runner_config.is_gated:
+                raise ValueError(
+                    "MXFP4 to FP8 conversion currently supports bias-free gated MoE"
+                )
+            # The converter accepts partial tiles, but the downstream FP8 MoE
+            # shuffle/GEMM and the gate/up boundary require complete blocks.
+            if hidden_size % 128 or intermediate_size_per_partition % 128:
+                raise ValueError(
+                    "MXFP4 to FP8 MoE requires hidden_size and the local TP "
+                    "intermediate size to be divisible by 128"
+                )
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         if self.quant_config.is_checkpoint_fp8_serialized:
@@ -1179,6 +1213,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_input_scale = None
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if self.convert_mxfp4_to_fp8:
+            # A second post-load pass must not normalize FNUZ or shuffle again.
+            if not getattr(layer, "_mxfp4_to_fp8_converted", False):
+                self._convert_mxfp4_to_fp8_128block(layer)
+            return
+
         # AMD FP4 experts: use aiter's native MXFP4 MoE path
         if _use_aiter and self.is_fp4_expert:
             gu_intv = envs.SGLANG_USE_AITER_MOE_GU_ITLV.get()
@@ -1601,6 +1641,79 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             align_mxfp8_moe_weights_for_flashinfer_trtllm(layer)
 
+    def _convert_mxfp4_to_fp8_128block(self, layer: Module) -> None:
+        """Prepare packed checkpoint experts for the standard AITER FP8 runner."""
+        if not self.runner.runner_backend.is_aiter():
+            raise ValueError(
+                "MXFP4 to FP8 conversion requires the AITER MoE runner; "
+                "other runners cannot consume its shuffled weights"
+            )
+        try:
+            from aiter.ops.flydsl import mxfp4_to_fp8_128block
+        except ImportError as exc:
+            raise ImportError(
+                "MXFP4 to FP8 conversion requires an AITER build exposing "
+                "aiter.ops.flydsl.mxfp4_to_fp8_128block and a compatible FlyDSL "
+                "installation (validated with flydsl==0.3.2)"
+            ) from exc
+
+        # Check both projections before replacing either one. Inputs must still
+        # be the checkpoint's row-major packed bytes, not native MXFP4 shuffles.
+        for prefix in ("w13", "w2"):
+            weight = getattr(layer, prefix + "_weight")
+            scale = getattr(layer, prefix + "_weight_scale_inv")
+            if (
+                weight.dtype != torch.uint8
+                or scale.dtype != torch.uint8
+                or getattr(weight, "is_shuffled", False)
+            ):
+                raise ValueError(
+                    "MXFP4 to FP8 conversion requires unshuffled uint8 "
+                    "checkpoint weights and E8M0 scale codes"
+                )
+            if (
+                weight.ndim != 3
+                or min(weight.shape) <= 0
+                or weight.shape[1] % 128
+                or weight.shape[2] % 64
+                or tuple(scale.shape) != (*weight.shape[:2], weight.shape[2] // 16)
+            ):
+                raise ValueError(
+                    "MXFP4 to FP8 MoE requires complete 128x128 blocks and "
+                    "scales[E,N,K/32] for packed weights[E,N,K/2]"
+                )
+
+        # Replace each projection immediately to limit peak loading memory.
+        # The converter already selects FNUZ on gfx942; do not run the usual
+        # checkpoint FN-to-FNUZ normalization on these weights a second time.
+        for weight_name, scale_name in (
+            ("w13_weight", "w13_weight_scale_inv"),
+            ("w2_weight", "w2_weight_scale_inv"),
+        ):
+            weight, scale = mxfp4_to_fp8_128block(
+                getattr(layer, weight_name).data,
+                getattr(layer, scale_name).data,
+            )
+            weight = shuffle_weight(weight, (16, 16))
+            copy_or_rebind_param(layer, weight_name, weight)
+            copy_or_rebind_param(layer, scale_name, scale)
+            getattr(layer, weight_name).is_shuffled = True
+            getattr(layer, scale_name).format_ue8m0 = False
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
+        layer.hidden_pad = 0
+        layer.intermediate_pad = 0
+        # Preserve the shared checkpoint config for loaders of other layers.
+        # Only this method's runtime dispatch changes to PER_128X128 FP8 MoE.
+        self.is_fp4_expert = False
+        layer._mxfp4_to_fp8_converted = True
+        logger.info(
+            "MXFP4 -> FP8 128x128 via FlyDSL: w13=%s, w2=%s, dtype=%s; AITER FP8 blockscale MoE",
+            tuple(layer.w13_weight.shape),
+            tuple(layer.w2_weight.shape),
+            layer.w13_weight.dtype,
+        )
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
@@ -1824,6 +1937,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
+
+        if self.convert_mxfp4_to_fp8:
+            if not moe_runner_backend.is_aiter():
+                raise ValueError(
+                    "MXFP4 to FP8 conversion requires the AITER MoE runner; "
+                    "select --moe-runner-backend aiter with a supported A2A backend"
+                )
+            if (moe_runner_config.swiglu_limit or 0.0) > 0:
+                raise ValueError(
+                    "MXFP4 to FP8 conversion does not support the clamped, "
+                    "interleaved SwiGLU runner path"
+                )
 
         if (
             moe_runner_backend.is_deep_gemm()

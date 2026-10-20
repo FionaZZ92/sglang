@@ -938,7 +938,18 @@ class MiMoV2DecoderLayer(nn.Module):
             or getattr(self.mlp, "_enable_a2a_moe", False)
         ):
             return ""
-        weight = getattr(getattr(self.mlp, "experts", None), "w13_weight", None)
+        experts = getattr(self.mlp, "experts", None)
+        weight = getattr(experts, "w13_weight", None)
+        # This selector runs before checkpoint loading. Packed MXFP4 experts
+        # become FP8 during Fp8MoEMethod.process_weights_after_loading.
+        if (
+            getattr(
+                getattr(experts, "quant_method", None), "convert_mxfp4_to_fp8", False
+            )
+            and weight is not None
+            and weight.dtype == torch.uint8
+        ):
+            return "fp8_moe"
         return "fp8_moe" if weight is not None and weight.dtype in _FP8_DTYPES else ""
 
     def _prefill_moe_quant_format(self, forward_batch: ForwardBatch) -> str:

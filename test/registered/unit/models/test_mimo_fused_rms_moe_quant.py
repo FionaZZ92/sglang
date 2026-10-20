@@ -56,9 +56,7 @@ def test_mimo_fused_rms_moe_quant_selector(
             is_auto=lambda: backend == "auto",
         ),
     )
-    monkeypatch.setattr(
-        mimo_v2, "get_moe_expert_parallel_world_size", lambda: ep_size
-    )
+    monkeypatch.setattr(mimo_v2, "get_moe_expert_parallel_world_size", lambda: ep_size)
     layer = _decoder_stub(weight_dtype)
 
     with mimo_v2.envs.SGLANG_MIMO_FUSED_RMS_MOE_QUANT.override(enabled):
@@ -76,6 +74,32 @@ def test_mimo_moe_inputs_preserve_router_bf16_and_prequantized_expert_input():
     )
     assert router_input is normalized
     assert expert_input == (quantized, scale)
+
+
+@pytest.mark.parametrize("convert", [False, True])
+def test_mimo_packed_experts_select_fused_quant_before_conversion(monkeypatch, convert):
+    monkeypatch.setattr(mimo_v2, "is_gfx942_supported", lambda: True)
+    monkeypatch.setattr(mimo_v2, "get_moe_expert_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        mimo_v2,
+        "get_moe_runner_backend",
+        lambda: SimpleNamespace(
+            is_aiter=lambda: True,
+            is_auto=lambda: False,
+        ),
+    )
+    layer = _decoder_stub(torch.uint8)
+    layer.mlp.experts.quant_method = SimpleNamespace(
+        convert_mxfp4_to_fp8=convert,
+    )
+    with (
+        mimo_v2.envs.SGLANG_USE_AITER.override(True),
+        mimo_v2.envs.SGLANG_MIMO_FUSED_RMS_MOE_QUANT.override(True),
+        mimo_v2.envs.SGLANG_MXFP4_TO_FP8_128BLOCK.override(convert),
+    ):
+        assert layer._detect_fused_rms_moe_quant_format() == (
+            "fp8_moe" if convert else ""
+        )
 
 
 def test_mimo_noaux_topk_reweights_from_logsigmoid_without_underflow():
