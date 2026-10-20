@@ -18,7 +18,7 @@ case "${TARGET_MODEL_VARIANT}" in
     default_fmoe_config="${AITER_ROOT}/aiter/configs/model_configs/mimo_v2_5_pro_b16_tuned_fmoe.csv"
     ;;
   mxfp4)
-    export MODEL="${MODEL:-/models/MiMo-V2.5-Pro-FP4-DFlash}"
+    export MODEL="${MODEL:-/models/MiMo-V2.6-Pro-RL}"
     export MIMO_TARGET_WEIGHT_FORMAT=mxfp4
     default_fmoe_config="${AITER_ROOT}/aiter/configs/model_configs/mimo_v2_5_pro_tuned_fmoe.csv"
     ;;
@@ -33,10 +33,11 @@ export AITER_MXFP4_STAGE2_OUTPUT_DTYPE="${AITER_MXFP4_STAGE2_OUTPUT_DTYPE:-bf16}
 export HOST="${HOST:-0.0.0.0}"
 export PORT="${PORT:-30001}"
 export MOE_RUNNER_BACKEND="${MOE_RUNNER_BACKEND:-aiter}"
-export MM_ATTENTION_BACKEND="${MM_ATTENTION_BACKEND:-}"
+# MiMo vision blocks request FA3 explicitly; override it with a ROCm backend.
+export MM_ATTENTION_BACKEND="${MM_ATTENTION_BACKEND:-triton_attn}"
 
 export SPECULATIVE_ALGORITHM=DFLASH
-export SPECULATIVE_DRAFT_MODEL="${SPECULATIVE_DRAFT_MODEL:-/models/MiMo-V2.5-Pro-FP4-DFlash/dflash}"
+export SPECULATIVE_DRAFT_MODEL="${SPECULATIVE_DRAFT_MODEL:-${MODEL}/dflash}"
 export SPECULATIVE_NUM_DRAFT_TOKENS=8
 export SPECULATIVE_DRAFT_ATTENTION_BACKEND=aiter
 export SPECULATIVE_DRAFT_KV_CACHE_DTYPE=bf16
@@ -191,11 +192,10 @@ echo "Configuration: model=${MODEL}, target-format=${MIMO_TARGET_WEIGHT_FORMAT},
 echo "AITER root/configs: ${AITER_ROOT}; fmoe=$(basename -- "${AITER_CONFIG_FMOE}"); gemm=$(basename -- "${AITER_CONFIG_GEMM_A8W8_BLOCKSCALE}"); bpreshuffle=$(basename -- "${AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE}")"
 echo "DFlash: draft-tokens=${SPECULATIVE_NUM_DRAFT_TOKENS}, draft-model=${SPECULATIVE_DRAFT_MODEL}, draft-attention=${SPECULATIVE_DRAFT_ATTENTION_BACKEND}, draft-kv=${SPECULATIVE_DRAFT_KV_CACHE_DTYPE}, draft-window=${SPECULATIVE_DRAFT_WINDOW_SIZE}"
 echo "DFlash acceptance: $([[ ${SGLANG_DFLASH_PERFORMANCE_MODE} == 1 ]] && echo simulated:${SGLANG_SIMULATE_ACC_LEN}/${SGLANG_SIMULATE_ACC_METHOD} || echo real)"
-echo "Multimodal attention: ${MM_ATTENTION_BACKEND:-auto}"
+echo "Multimodal attention: ${MM_ATTENTION_BACKEND}"
 echo "Custom all-reduce: ${custom_all_reduce_status}; radix cache: ${radix_cache_status}"
 echo "Server log: ${LOG_DIR}/${LOG_FILE}"
 echo "Tokenizer workers: ${TOKENIZER_WORKER_NUM}; server seed: ${SERVER_RANDOM_SEED:-auto}"
-
 python3 -u -m sglang.launch_server \
   --model-path "${MODEL}" \
   --tp-size 8 \
